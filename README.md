@@ -76,3 +76,8 @@ We welcome contributors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and our [
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-118 -->
+- #118: [High] Build a generic governance-executed calldata forwarder with an allowlist of callable contracts
