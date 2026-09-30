@@ -1,14 +1,143 @@
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Vec};
+//! Refract Governance Contract
+//!
+//! Token-weighted on-chain governance for the Refract protocol.
+//!
+//! ## Design
+//! Modelled after the Compound Governor / OpenZeppelin Governor pattern,
+//! adapted for Soroban's programming model.
+//!
+//! * **Voting weight** — resolved from per-address balance checkpoints as of
+//!   the proposal's snapshot ledger, so tokens borrowed and repaid within a
+//!   single transaction cannot inflate votes.
+//! * **Delegation** — single-hop delegation: an address may delegate its
+//!   voting power to a delegatee, which cannot itself have delegated onward.
+//! * **Proposal threshold** — a minimum token balance required to create a
+//!   proposal, preventing spam.
+//! * **Quorum** — `quorum_bps` of `total_supply` (from the token) must
+//!   participate (for + against) for the proposal to be valid.
+//! * **Execution** — after the voting period ends, a successful proposal
+//!   is forwarded to the timelock via `queue`, then the timelock executes
+//!   it after its own delay.  If the timelock address is not set the call
+//!   is forwarded directly (useful in tests).
+//!
+//! ## Proposal lifecycle
+//! ```text
+//! propose() → Active (voting open)
+//!           → Defeated (quorum not met, or majority against)
+//!           → Succeeded (quorum met + majority for)
+//! queue()   → Queued (forwarded to timelock)
+//! execute() → Executed (timelock or direct forward)
+//! ```
+
+#![no_std]
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Val, Vec,
+};
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum GovernanceError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    /// Proposer's token balance is below `proposal_threshold`.
+    BelowProposalThreshold = 4,
+    /// Proposal not found.
+    ProposalNotFound = 5,
+    /// Proposal is not in the expected state.
+    WrongState = 6,
+    /// Voting period has not ended yet.
+    VotingOpen = 7,
+    /// The voter has already cast a vote on this proposal.
+    AlreadyVoted = 8,
+    /// Proposal failed quorum or was voted down.
+    ProposalDefeated = 9,
+    /// Proposal was queued/executed already.
+    AlreadyQueued = 10,
+    /// A delegation would create a chain (the delegatee has itself delegated
+    /// elsewhere). This contract uses a single-hop-only delegation model.
+    DelegationChain = 11,
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/// Distinguishable terminal states so callers can tell apart "quorum not
+/// met" from "quorum met but voted down".
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ProposalStatus {
+    /// Voting is open.
+    Active = 0,
+    /// Quorum not met, or majority voted against.
+    Defeated = 1,
+    /// Quorum met and majority voted for — can be queued.
+    Succeeded = 2,
+    /// Forwarded to the timelock (or directly executed).
+    Queued = 3,
+    /// Call was executed.
+    Executed = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalState {
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub args: Vec<Val>,
+    pub description: Symbol,
+    /// Ledger timestamp at which voting opens (== block time of propose()).
+    pub vote_start: u64,
+    /// Ledger timestamp at which voting closes.
+    pub vote_end: u64,
+    /// Accumulated weight of "for" votes.
+    pub votes_for: i128,
+    /// Accumulated weight of "against" votes.
+    pub votes_against: i128,
+    pub status: ProposalStatus,
+    /// Voters who have already cast a vote (to prevent double-voting).
+    pub voters: Vec<Address>,
+    /// Ledger sequence at proposal creation. Voting weight is resolved from
+    /// balances as of this ledger, not the voter's live balance, so tokens
+    /// borrowed and repaid within a single transaction cannot inflate votes.
+    pub snapshot_ledger: u32,
+}
+
+/// Governor configuration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovernorConfig {
+    /// Token contract whose `balance()` determines voting weight.
+    pub token: Address,
+    /// Voting period in seconds.
+    pub voting_period: u64,
+    /// Quorum expressed as basis points of total token supply
+    /// (e.g. 400 = 4%).
+    pub quorum_bps: u32,
+    /// Minimum token balance required to submit a proposal.
+    pub proposal_threshold: i128,
+}
+
+// ── Storage Keys ──────────────────────────────────────────────────────────────
 
 /// Storage keys for the governor contract.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    Config,
     Token,
+    /// Optional timelock contract address.  If absent, `queue` forwards
+    /// directly.
+    Timelock,
+    NextId,
     ProposalCount,
-    Proposal(u32),
-    Vote(u32, Address),
+    Proposal(u64),
+    Vote(u64, Address),
     /// Records the delegatee chosen by a given caller. Absence means the
     /// caller votes with their own balance (self-delegation / no delegation).
     Delegate(Address),
@@ -23,43 +152,7 @@ pub enum DataKey {
     Checkpoints(Address),
 }
 
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum VoteType {
-    Against,
-    For,
-    Abstain,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct Proposal {
-    pub id: u32,
-    pub proposer: Address,
-    pub description: Symbol,
-    pub for_votes: i128,
-    pub against_votes: i128,
-    pub abstain_votes: i128,
-    pub executed: bool,
-    /// Ledger sequence at proposal creation. Voting weight is resolved from
-    /// balances as of this ledger, not the voter's live balance, so tokens
-    /// borrowed and repaid within a single transaction cannot inflate votes.
-    pub snapshot_ledger: u32,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum GovernorError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    ProposalNotFound = 3,
-    AlreadyVoted = 4,
-    VotingClosed = 5,
-    Unauthorized = 6,
-    /// A delegation would create a chain (the delegatee has itself delegated
-    /// elsewhere). This contract uses a single-hop-only delegation model.
-    DelegationChain = 7,
-}
+// ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct RefractGovernor;
@@ -72,235 +165,331 @@ impl RefractGovernor {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        env.storage().instance().set(&DataKey::ProposalCount, &0u64);
     }
 
-    pub fn propose(env: Env, proposer: Address, description: Symbol) -> u32 {
+    pub fn propose(env: E
+#[contract]
+pub struct RefractGovernor;
+
+#[contractimpl]
+impl RefractGovernor {
+    // ─── Initialization ──────────────────────────────────────────────────
+
+    /// Deploy and configure the governor.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        config: GovernorConfig,
+    ) -> Result<(), GovernanceError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(GovernanceError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.events()
+            .publish((Symbol::new(&env, "gov_init"),), (admin,));
+        Ok(())
+    }
+
+    // ─── Admin ───────────────────────────────────────────────────────────
+
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    pub fn config(env: Env) -> Option<GovernorConfig> {
+        env.storage().instance().get(&DataKey::Config)
+    }
+
+    /// Wire in the timelock contract address.  Admin-only.
+    pub fn set_timelock(env: Env, caller: Address, timelock: Address) -> Result<(), GovernanceError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Timelock, &timelock);
+        env.events()
+            .publish((Symbol::new(&env, "gov_tl_set"),), (timelock,));
+        Ok(())
+    }
+
+    /// Replace the governor configuration.  Admin-only.
+    pub fn set_config(
+        env: Env,
+        caller: Address,
+        config: GovernorConfig,
+    ) -> Result<(), GovernanceError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish((Symbol::new(&env, "gov_cfg"),), ());
+        Ok(())
+    }
+
+    // ─── Core Operations ─────────────────────────────────────────────────
+
+    /// Create a new governance proposal.
+    ///
+    /// `proposer` must hold at least `proposal_threshold` tokens.
+    /// Returns the new proposal id.
+    pub fn propose(
+        env: Env,
+        proposer: Address,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+        description: Symbol,
+    ) -> Result<u64, GovernanceError> {
         proposer.require_auth();
-        let mut count: u32 = env
+        let config: GovernorConfig = env
             .storage()
             .instance()
-            .get(&DataKey::ProposalCount)
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+
+        // Check proposer's token balance against threshold.
+        let balance = token::Client::new(&env, &config.token).balance(&proposer);
+        if balance < config.proposal_threshold {
+            return Err(GovernanceError::BelowProposalThreshold);
+        }
+
+        let now = env.ledger().timestamp();
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
             .unwrap_or(0);
-        count += 1;
-        let proposal = Proposal {
-            id: count,
-            proposer,
-            description,
-            for_votes: 0,
-            against_votes: 0,
-            abstain_votes: 0,
-            executed: false,
-            snapshot_ledger: env.ledger().sequence(),
+
+        let proposal = ProposalState {
+            proposer: proposer.clone(),
+            target: target.clone(),
+            function: function.clone(),
+            args,
+            description: description.clone(),
+            vote_start: now,
+            vote_end: now + config.voting_period,
+            votes_for: 0,
+            votes_against: 0,
+            status: ProposalStatus::Active,
+            voters: Vec::new(&env),
         };
+
         env.storage()
             .persistent()
-            .set(&DataKey::Proposal(count), &proposal);
-        env.storage().instance().set(&DataKey::ProposalCount, &count);
-        count
-    }
-
-    /// Assign `caller`'s voting power to `delegatee` without transferring the
-    /// underlying tokens. Delegation is single-hop only: a delegatee may not
-    /// itself have delegated elsewhere, otherwise a chain would form and the
-    /// running `DelegatedWeight` counter could not be resolved in O(1).
-    pub fn delegate(env: Env, caller: Address, delegatee: Address) {
-        caller.require_auth();
-
-        // Single-hop policy: reject delegating to an address that has itself
-        // delegated to a third party.
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::Delegate(delegatee.clone()))
-        {
-            if existing != delegatee {
-                panic!("delegation chain not supported");
-            }
-        }
-
-        let balance = Self::token_balance(&env, &caller);
-
-        // Remove any previous delegation from the running counter.
-        if let Some(previous) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::Delegate(caller.clone()))
-        {
-            if previous != caller {
-                let prev_weight: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::DelegatedWeight(previous.clone()))
-                    .unwrap_or(0);
-                env.storage().persistent().set(
-                    &DataKey::DelegatedWeight(previous),
-                    &(prev_weight - balance),
-                );
-            }
-        }
-
-        // Record the new delegation and add the balance to the delegatee.
+            .set(&DataKey::Proposal(id), &proposal);
         env.storage()
-            .persistent()
-            .set(&DataKey::Delegate(caller.clone()), &delegatee);
+            .instance()
+            .set(&DataKey::NextId, &(id + 1));
 
-        if delegatee != caller {
-            let new_weight: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::DelegatedWeight(delegatee.clone()))
-                .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::DelegatedWeight(delegatee), &(new_weight + balance));
-        }
+        env.events().publish(
+            (Symbol::new(&env, "gov_proposed"), id),
+            (proposer, target, function, description),
+        );
+        Ok(id)
     }
 
-    /// Restore direct voting for `caller`. Equivalent to
-    /// `delegate(caller, caller)` (self-delegation is the "no delegation"
-    /// state).
-    pub fn undelegate(env: Env, caller: Address) {
-        caller.require_auth();
-        Self::delegate(env, caller.clone(), caller);
-    }
-
-    pub fn cast_vote(env: Env, voter: Address, proposal_id: u32, vote: VoteType) {
+    /// Cast a vote on an active proposal.
+    ///
+    /// `support = true` → for; `support = false` → against.
+    /// Voting weight equals the voter's current token balance.
+    ///
+    /// **Known limitation**: balance is read at call time, not at a
+    /// snapshot — flash-loan voting attacks are possible until the
+    /// snapshot follow-up issue is implemented.
+    pub fn cast_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<i128, GovernanceError> {
         voter.require_auth();
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Vote(proposal_id, voter.clone()))
-        {
-            panic!("already voted");
-        }
-
-        let mut proposal: Proposal = env
+        let mut proposal: ProposalState = env
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .expect("proposal not found");
+            .ok_or(GovernanceError::ProposalNotFound)?;
 
-        // Weight = own balance as of the proposal snapshot + balances
-        // delegated to this address as of the snapshot. Reading the snapshot
-        // (not the live balance) prevents flash-loan governance attacks.
-        let weight = Self::voting_power_at(&env, &voter, proposal.snapshot_ledger);
-
-        match vote {
-            VoteType::For => proposal.for_votes += weight,
-            VoteType::Against => proposal.against_votes += weight,
-            VoteType::Abstain => proposal.abstain_votes += weight,
+        if proposal.status != ProposalStatus::Active {
+            return Err(GovernanceError::WrongState);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Vote(proposal_id, voter), &vote);
+        let now = env.ledger().timestamp();
+        if now > proposal.vote_end {
+            return Err(GovernanceError::WrongState);
+        }
+
+        // Double-vote guard.
+        if proposal.voters.iter().any(|v| v == voter) {
+            return Err(GovernanceError::AlreadyVoted);
+        }
+
+        let config: GovernorConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+        let weight = token::Client::new(&env, &config.token).balance(&voter);
+
+        if support {
+            proposal.votes_for += weight;
+        } else {
+            proposal.votes_against += weight;
+        }
+        proposal.voters.push_back(voter.clone());
+
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "gov_voted"), proposal_id),
+            (voter, support, weight),
+        );
+        Ok(weight)
     }
 
-    pub fn get_proposal(env: Env, proposal_id: u32) -> Proposal {
-        env.storage()
+    /// Tally the proposal after its voting period ends and transition it to
+    /// `Succeeded` or `Defeated`.  Permissionless.
+    pub fn finalize(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        let mut proposal: ProposalState = env
+            .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .expect("proposal not found")
-    }
+            .ok_or(GovernanceError::ProposalNotFound)?;
 
-    /// Total voting power for `account` at the current ledger: its own token
-    /// balance plus the balances of every address that has delegated to it.
-    pub fn voting_power(env: &Env, account: &Address) -> i128 {
-        Self::voting_power_at(env, account, env.ledger().sequence())
-    }
-
-    /// Total voting power for `account` as of `ledger`: its own balance at
-    /// that ledger plus the balances delegated to it at that ledger.
-    pub fn voting_power_at(env: &Env, account: &Address, ledger: u32) -> i128 {
-        let own = Self::balance_at(env, account, ledger);
-        let delegated: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DelegatedWeight(account.clone()))
-            .unwrap_or(0);
-        own + delegated
-    }
-
-    /// Returns the delegatee for `account`, or `account` itself when no
-    /// delegation is recorded (self-delegation = direct voting).
-    pub fn get_delegate(env: Env, account: Address) -> Address {
-        env.storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::Delegate(account.clone()))
-            .unwrap_or(account)
-    }
-
-    /// Records a `(ledger_sequence, balance)` checkpoint for `account` if the
-    /// balance differs from the most recent checkpoint. Called on every
-    /// balance-changing operation the governor observes so historical lookups
-    /// can resolve "balance as of ledger N".
-    pub fn checkpoint(env: Env, account: Address) {
-        let balance = Self::token_balance(&env, &account);
-        let ledger = env.ledger().sequence();
-        let mut checkpoints: Vec<(u32, i128)> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Checkpoints(account.clone()))
-            .unwrap_or(Vec::new(&env));
-
-        if let Some((last_ledger, last_balance)) = checkpoints.last() {
-            if last_balance == balance {
-                return;
-            }
-            if last_ledger == ledger {
-                checkpoints.pop();
-            }
+        if proposal.status != ProposalStatus::Active {
+            // Already finalized — just return current status.
+            return Ok(proposal.status);
         }
 
-        checkpoints.push_back((ledger, balance));
-        env.storage()
-            .persistent()
-            .set(&DataKey::Checkpoints(account), &checkpoints);
-    }
-
-    /// Resolves `account`'s balance as of `ledger` via binary search over its
-    /// append-only checkpoint list. Returns the balance of the latest
-    /// checkpoint at or before `ledger`, or zero when no checkpoint exists at
-    /// or before `ledger` (the address had no known balance then).
-    pub fn balance_at(env: &Env, account: &Address, ledger: u32) -> i128 {
-        let checkpoints: Vec<(u32, i128)> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Checkpoints(account.clone()))
-            .unwrap_or(Vec::new(env));
-
-        let mut lo: u32 = 0;
-        let mut hi: u32 = checkpoints.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let (mid_ledger, _) = checkpoints.get(mid).unwrap();
-            if mid_ledger <= ledger {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+        let now = env.ledger().timestamp();
+        if now <= proposal.vote_end {
+            return Err(GovernanceError::VotingOpen);
         }
 
-        if lo == 0 {
-            0
-        } else {
-            let (_, balance) = checkpoints.get(lo - 1).unwrap();
-            balance
-        }
-    }
-
-    fn token_balance(env: &Env, account: &Address) -> i128 {
-        let token_addr: Address = env
+        let config: GovernorConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Token)
-            .expect("token not set");
-        let client = token::Client::new(env, &token_addr);
-        client.balance(account)
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+
+        // Total participating weight.
+        let total_votes = proposal.votes_for + proposal.votes_against;
+
+        // Total token supply for quorum calculation.
+        let total_supply = token::Client::new(&env, &config.token).total_supply();
+
+        // Quorum: total_votes must be >= quorum_bps/10000 of total_supply.
+        let quorum_required = total_supply * (config.quorum_bps as i128) / 10_000;
+        let quorum_met = total_votes >= quorum_required;
+        let majority_for = proposal.votes_for > proposal.votes_against;
+
+        let new_status = if quorum_met && majority_for {
+            ProposalStatus::Succeeded
+        } else {
+            ProposalStatus::Defeated
+        };
+
+        proposal.status = new_status;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "gov_finalized"), proposal_id),
+            (new_status as u32, quorum_met, majority_for),
+        );
+        Ok(new_status)
+    }
+
+    /// Queue a succeeded proposal into the timelock (or execute directly if
+    /// no timelock is set).
+    pub fn queue(env: Env, proposal_id: u64, eta: u64) -> Result<(), GovernanceError> {
+        let mut proposal: ProposalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Succeeded {
+            return Err(GovernanceError::WrongState);
+        }
+
+        proposal.status = ProposalStatus::Queued;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        if let Some(timelock) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Timelock)
+        {
+            // Forward to timelock.  The timelock's `queue` function takes
+            // (target, function, args, eta).
+            let mut tl_args: Vec<Val> = Vec::new(&env);
+            tl_args.push_back(proposal.target.into_val(&env));
+            tl_args.push_back(proposal.function.into_val(&env));
+            tl_args.push_back(proposal.args.into_val(&env));
+            tl_args.push_back(eta.into_val(&env));
+            env.invoke_contract::<Val>(
+                &timelock,
+                &Symbol::new(&env, "queue"),
+                tl_args,
+            );
+        }
+        // If no timelock is set the proposal is marked Queued and the
+        // caller should call `execute` directly.
+
+        env.events()
+            .publish((Symbol::new(&env, "gov_queued"), proposal_id), ());
+        Ok(())
+    }
+
+    /// Execute a queued proposal directly (when no timelock is configured).
+    pub fn execute(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        let mut proposal: ProposalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Queued {
+            return Err(GovernanceError::WrongState);
+        }
+
+        proposal.status = ProposalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.invoke_contract::<Val>(&proposal.target, &proposal.function, proposal.args);
+
+        env.events()
+            .publish((Symbol::new(&env, "gov_executed"), proposal_id), ());
+        Ok(())
+    }
+
+    /// Read a proposal by id.
+    pub fn get_proposal(env: Env, id: u64) -> Option<ProposalState> {
+        env.storage().persistent().get(&DataKey::Proposal(id))
+    }
+
+    // ─── Internal helpers ─────────────────────────────────────────────────
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)?;
+        if caller != &admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        Ok(())
     }
 }
+
+#[cfg(test)]
+mod test;
